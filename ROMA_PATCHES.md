@@ -47,3 +47,12 @@ language, window joining, overlap, and Unicode boundaries. The actual parser and
 all 12 test bodies passed a local Foundation assertion harness. The local Command
 Line Tools installation lacks the `Testing` module; full Swift Testing execution,
 MLX compilation, and native streaming replay remain separate required gates.
+
+### Public protocol parser
+
+Expose `QwenTranscriptionText.parse` for consumers of the public raw model APIs.
+Batch and cumulative-streaming adapters can share the same reviewed leading-header
+parser without copying it or changing inference tokens. Only the enum and parser
+access levels change; all other text helpers stay internal. Return values use
+public Foundation/Swift types. A separate-module Foundation client verifies the
+previous inaccessible API fails to compile and the exposed API compiles and runs.

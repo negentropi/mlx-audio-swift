@@ -1,8 +1,8 @@
 import Foundation
 
 /// Interprets the leading Qwen response header without changing inference tokens.
-enum QwenTranscriptionText {
-    static func parse(
+public enum QwenTranscriptionText {
+    public static func parse(
         _ decoded: String,
         forcedLanguage: String? = nil,
         isFinal: Bool = true,
