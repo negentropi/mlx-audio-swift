@@ -1085,22 +1085,8 @@ public class Qwen3ASRModel: Module {
 
     // MARK: - Prompt Building
 
-    private func extractLanguage(from text: String) -> (language: String?, text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = "language "
-        let marker = "<asr_text>"
-
-        guard trimmed.hasPrefix(prefix), let markerRange = trimmed.range(of: marker) else {
-            return (nil, trimmed)
-        }
-
-        let languageStart = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
-        let detectedLanguage = trimmed[languageStart..<markerRange.lowerBound]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let transcript = trimmed[markerRange.upperBound...]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return (detectedLanguage.isEmpty ? nil : detectedLanguage, transcript)
+    private func extractLanguage(from text: String, isFinal: Bool = true, expectsHeader: Bool = false) -> (language: String?, text: String) {
+        QwenTranscriptionText.parse(text, isFinal: isFinal, expectsHeader: expectsHeader)
     }
 
     func normalizeLanguageName(_ language: String?) -> String? {
@@ -1147,7 +1133,7 @@ public class Qwen3ASRModel: Module {
             return (nil, "")
         }
 
-        return ("English", trimmed)
+        return (parsed.text.isEmpty ? nil : "English", parsed.text)
     }
 
     static func mergeLanguages(_ languages: [String?]) -> String? {
@@ -1560,7 +1546,7 @@ public class Qwen3ASRModel: Module {
                             let tokenText = tokenizer.decode(tokens: [nextToken])
                             if resolvedLanguage == nil {
                                 languagePrefixBuffer += tokenText
-                                let parsed = model.extractLanguage(from: languagePrefixBuffer)
+                                let parsed = model.extractLanguage(from: languagePrefixBuffer, isFinal: false, expectsHeader: true)
                                 if let detectedLanguage = parsed.language {
                                     resolvedLanguage = detectedLanguage
                                     if !parsed.text.isEmpty {
@@ -1580,7 +1566,7 @@ public class Qwen3ASRModel: Module {
                         remainingTokens -= chunkTokens.count
 
                         if resolvedLanguage == nil && !languagePrefixBuffer.isEmpty {
-                            continuation.yield(.token(languagePrefixBuffer))
+                            continuation.yield(.token(model.extractLanguage(from: languagePrefixBuffer, expectsHeader: true).text))
                         }
 
                         Memory.clearCache()
@@ -1604,7 +1590,7 @@ public class Qwen3ASRModel: Module {
 
                     // Emit final result
                     let decodedText = tokenizer.decode(tokens: allGeneratedTokens)
-                    let parsed = model.extractLanguage(from: decodedText)
+                    let parsed = model.extractLanguage(from: decodedText, expectsHeader: true)
                     let outputLanguage = resolvedLanguage ?? parsed.language
                     let text = language == nil ? parsed.text : decodedText.trimmingCharacters(in: .whitespacesAndNewlines)
                     let output = STTOutput(

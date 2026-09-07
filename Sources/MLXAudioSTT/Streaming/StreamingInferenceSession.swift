@@ -33,8 +33,8 @@ private struct DecodePassParams: Sendable {
     let model: UncheckedSendableBox<Qwen3ASRModel>
     let config: StreamingConfig
     let confirmedTokenIds: [Int]
-    /// completedText + confirmedText for display
-    let displayPrefix: String
+    /// Already parsed text from completed encoder windows.
+    let completedText: String
     let prevProvisional: [Int]
     let prevFirstSeen: [Date]
     let prevAgreementCounts: [Int]
@@ -639,7 +639,7 @@ private final class CohereStreamingInferenceSessionCore: @unchecked Sendable, St
 
     private func launchDecodePass(_ launch: CohereDecodeLaunch) {
         let snapshot = shared.withLock { state -> ([Int], String, [Int], [Date], [Int]) in
-            let prefix = QwenStreamingInferenceSessionCore.concatText(state.completedText, state.confirmedText)
+            let prefix = QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
             return (state.confirmedTokenIds,
                     prefix,
                     state.provisionalTokenIds,
@@ -732,7 +732,7 @@ private final class CohereStreamingInferenceSessionCore: @unchecked Sendable, St
     ) {
         let windowText = model.streamingDecodeText(tokens: tokenIds)
         let completedText = sharedState.withLock { state in
-            state.completedText = QwenStreamingInferenceSessionCore.concatText(state.completedText, windowText)
+            state.completedText = QwenTranscriptionText.concatText(state.completedText, windowText)
             state.confirmedTokenIds = []
             state.provisionalTokenIds = []
             state.provisionalFirstSeen = []
@@ -810,7 +810,7 @@ private final class CohereStreamingInferenceSessionCore: @unchecked Sendable, St
                 let promoted = Array(newProvisional.prefix(promoteCount))
                 state.confirmedTokenIds.append(contentsOf: promoted)
                 state.confirmedText = params.model.value.streamingDecodeText(tokens: state.confirmedTokenIds)
-                continuation?.yield(.confirmed(text: QwenStreamingInferenceSessionCore.concatText(
+                continuation?.yield(.confirmed(text: QwenTranscriptionText.concatText(
                     state.completedText,
                     state.confirmedText
                 )))
@@ -818,7 +818,7 @@ private final class CohereStreamingInferenceSessionCore: @unchecked Sendable, St
             state.provisionalTokenIds = finalProvisional
             state.provisionalFirstSeen = finalFirstSeen
             state.provisionalAgreementCounts = finalAgreementCounts
-            return QwenStreamingInferenceSessionCore.concatText(state.completedText, state.confirmedText)
+            return QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
         }
 
         let finalProvText = params.model.value.streamingDecodeText(tokens: finalProvisional)
@@ -924,7 +924,7 @@ private final class CohereStreamingInferenceSessionCore: @unchecked Sendable, St
                 state.provisionalAgreementCounts = []
             }
             state.confirmedText = model.streamingDecodeText(tokens: state.confirmedTokenIds)
-            return QwenStreamingInferenceSessionCore.concatText(state.completedText, state.confirmedText)
+            return QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
         }
 
         if Task.isCancelled {
@@ -1084,8 +1084,8 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
             var allTokens = state.confirmedTokenIds
             allTokens.append(contentsOf: state.provisionalTokenIds)
             if let tokenizer = model.tokenizer, !allTokens.isEmpty {
-                let windowText = tokenizer.decode(tokens: allTokens)
-                Self.appendText(windowText, to: &state.completedText)
+                let windowText = QwenTranscriptionText.parse(tokenizer.decode(tokens: allTokens), forcedLanguage: config.language, expectsHeader: true).text
+                QwenTranscriptionText.appendText(windowText, to: &state.completedText)
             }
             // Reset — next decode is a fresh start on new pending frames
             state.confirmedTokenIds = []
@@ -1139,7 +1139,7 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
         }
 
         let snapshot = shared.withLock { state -> ([Int], String, [Int], [Date], [Int]) in
-            let prefix = Self.concatText(state.completedText, state.confirmedText)
+            let prefix = state.completedText
             return (state.confirmedTokenIds,
                     prefix,
                     state.provisionalTokenIds,
@@ -1161,7 +1161,7 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
             model: UncheckedSendableBox(self.model),
             config: self.config,
             confirmedTokenIds: confirmedTokenIds,
-            displayPrefix: displayPrefix,
+            completedText: displayPrefix,
             prevProvisional: prevProvisional,
             prevFirstSeen: prevFirstSeen,
             prevAgreementCounts: prevAgreementCounts,
@@ -1186,162 +1186,6 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 encodedWindowCount: encodedWindowCount
             )
         }
-    }
-
-    private static func appendText(_ segment: String, to base: inout String) {
-        let normalizedSegment = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedSegment.isEmpty else { return }
-        if base.isEmpty {
-            base = normalizedSegment
-            return
-        }
-        let dedupedSegment = dedupeLeadingWordOverlap(base: base, segment: normalizedSegment)
-        let containedTrimmedSegment = trimContainedLeadingOverlap(base: base, segment: dedupedSegment)
-        guard !containedTrimmedSegment.isEmpty else { return }
-        if shouldSkipDuplicateAppend(base: base, segment: containedTrimmedSegment) {
-            return
-        }
-        if base.last?.isWhitespace == true || containedTrimmedSegment.first?.isWhitespace == true {
-            base += containedTrimmedSegment
-        } else {
-            base += " " + containedTrimmedSegment
-        }
-    }
-
-    private static func normalizedComparableWord(_ word: String) -> String {
-        let asciiApostrophe: UnicodeScalar = "'"
-        let smartApostrophe: UnicodeScalar = "’"
-        let normalizedScalars = word.lowercased().unicodeScalars.filter { scalar in
-            CharacterSet.alphanumerics.contains(scalar) ||
-                scalar == asciiApostrophe ||
-                scalar == smartApostrophe
-        }
-        return String(String.UnicodeScalarView(normalizedScalars))
-    }
-
-    private static func wordsEquivalent(
-        lhsRaw: String,
-        lhsNormalized: String,
-        rhsRaw: String,
-        rhsNormalized: String
-    ) -> Bool {
-        if !lhsNormalized.isEmpty && !rhsNormalized.isEmpty {
-            return lhsNormalized == rhsNormalized
-        }
-        return lhsRaw.caseInsensitiveCompare(rhsRaw) == .orderedSame
-    }
-
-    private static func normalizedWords(_ text: String) -> [String] {
-        text.split(whereSeparator: \.isWhitespace)
-            .map { normalizedComparableWord(String($0)) }
-            .filter { !$0.isEmpty }
-    }
-
-    private static func shouldSkipDuplicateAppend(base: String, segment: String) -> Bool {
-        let segmentWords = normalizedWords(segment)
-        guard !segmentWords.isEmpty else { return true }
-
-        let baseWords = normalizedWords(base)
-        guard !baseWords.isEmpty else { return false }
-
-        if baseWords.count < segmentWords.count { return false }
-        let lookbackCount = min(baseWords.count, max(segmentWords.count * 2, 48))
-        let tailWords = Array(baseWords.suffix(lookbackCount))
-        guard tailWords.count >= segmentWords.count else { return false }
-
-        let tailSuffix = Array(tailWords.suffix(segmentWords.count))
-        return tailSuffix == segmentWords
-    }
-
-    private static func containsContiguousSubsequence(
-        haystack: [String],
-        needle: [String]
-    ) -> Bool {
-        guard !needle.isEmpty, needle.count <= haystack.count else { return false }
-        let maxStart = haystack.count - needle.count
-        if maxStart < 0 { return false }
-
-        for start in 0...maxStart {
-            var matches = true
-            for idx in 0..<needle.count where haystack[start + idx] != needle[idx] {
-                matches = false
-                break
-            }
-            if matches {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    private static func trimContainedLeadingOverlap(base: String, segment: String) -> String {
-        let segmentRawWords = segment.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard segmentRawWords.count >= 8 else { return segment }
-
-        let baseWords = normalizedWords(base)
-        guard !baseWords.isEmpty else { return segment }
-
-        let segmentWords = segmentRawWords.map { normalizedComparableWord($0) }
-        let lookbackCount = min(baseWords.count, max(segmentWords.count * 4, 160))
-        let tailWords = Array(baseWords.suffix(lookbackCount))
-        guard !tailWords.isEmpty else { return segment }
-
-        let minOverlapWords = min(12, segmentWords.count)
-        guard minOverlapWords >= 8 else { return segment }
-
-        for overlap in stride(from: segmentWords.count, through: minOverlapWords, by: -1) {
-            let prefix = Array(segmentWords.prefix(overlap))
-            if containsContiguousSubsequence(haystack: tailWords, needle: prefix) {
-                let remainder = segmentRawWords.dropFirst(overlap)
-                return remainder.joined(separator: " ")
-            }
-        }
-
-        return segment
-    }
-
-    private static func dedupeLeadingWordOverlap(base: String, segment: String, maxWords: Int = 64) -> String {
-        let baseWords = base.split(whereSeparator: \.isWhitespace).map(String.init)
-        let segmentWords = segment.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard !baseWords.isEmpty, !segmentWords.isEmpty else { return segment }
-        let baseWordsNormalized = baseWords.map { normalizedComparableWord($0) }
-        let segmentWordsNormalized = segmentWords.map { normalizedComparableWord($0) }
-
-        let maxOverlap = min(maxWords, min(baseWords.count, segmentWords.count))
-        var overlapCount = 0
-
-        if maxOverlap > 0 {
-            for size in stride(from: maxOverlap, through: 1, by: -1) {
-                var matches = true
-                for idx in 0..<size {
-                    let lhsIdx = baseWords.count - size + idx
-                    if !wordsEquivalent(
-                        lhsRaw: baseWords[lhsIdx],
-                        lhsNormalized: baseWordsNormalized[lhsIdx],
-                        rhsRaw: segmentWords[idx],
-                        rhsNormalized: segmentWordsNormalized[idx]
-                    ) {
-                        matches = false
-                        break
-                    }
-                }
-                if matches {
-                    overlapCount = size
-                    break
-                }
-            }
-        }
-
-        guard overlapCount > 0 else { return segment }
-        let remainder = segmentWords.dropFirst(overlapCount)
-        return remainder.joined(separator: " ")
-    }
-
-    fileprivate static func concatText(_ a: String, _ b: String) -> String {
-        var result = a
-        appendText(b, to: &result)
-        return result
     }
 
     // MARK: - Decode (identical logic for every pass)
@@ -1422,11 +1266,15 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
             allTokenIds.append(nextToken)
 
             if allTokenIds.count > confirmedCount {
-                let newProvisional = Array(allTokenIds.dropFirst(confirmedCount))
-                let provText = tokenizer.decode(tokens: newProvisional)
+                let display = QwenTranscriptionText.display(
+                    completed: params.completedText,
+                    confirmed: tokenizer.decode(tokens: params.confirmedTokenIds),
+                    fullWindow: tokenizer.decode(tokens: allTokenIds),
+                    forcedLanguage: params.config.language
+                )
                 continuation?.yield(.displayUpdate(
-                    confirmedText: params.displayPrefix,
-                    provisionalText: provText
+                    confirmedText: display.confirmed,
+                    provisionalText: display.provisional
                 ))
             }
 
@@ -1520,23 +1368,31 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
         let finalFirstSeen = Array(nextFirstSeen.dropFirst(promoteCount))
         let finalAgreementCounts = Array(nextAgreementCounts.dropFirst(promoteCount))
 
-        let displayPrefix: String = sharedState.withLock { state in
+        let display = sharedState.withLock { state in
             if promoteCount > 0 {
                 let promoted = Array(newProvisional.prefix(promoteCount))
                 state.confirmedTokenIds.append(contentsOf: promoted)
-                state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
-                continuation?.yield(.confirmed(text: Self.concatText(state.completedText, state.confirmedText)))
+                state.confirmedText = QwenTranscriptionText.parse(
+                    tokenizer.decode(tokens: state.confirmedTokenIds),
+                    forcedLanguage: params.config.language, isFinal: false
+                ).text
+                continuation?.yield(.confirmed(text: QwenTranscriptionText.concatText(state.completedText, state.confirmedText)))
             }
             state.provisionalTokenIds = finalProvisional
             state.provisionalFirstSeen = finalFirstSeen
             state.provisionalAgreementCounts = finalAgreementCounts
-            return Self.concatText(state.completedText, state.confirmedText)
+            let current = QwenTranscriptionText.display(
+                completed: state.completedText,
+                confirmed: tokenizer.decode(tokens: state.confirmedTokenIds),
+                fullWindow: tokenizer.decode(tokens: allTokenIds),
+                forcedLanguage: params.config.language
+            )
+            return current
         }
 
-        let finalProvText = tokenizer.decode(tokens: finalProvisional)
         continuation?.yield(.displayUpdate(
-            confirmedText: displayPrefix,
-            provisionalText: finalProvText
+            confirmedText: display.confirmed,
+            provisionalText: display.provisional
         ))
 
         let totalAudioSeconds = Double(totalSamples) / 16000.0
@@ -1601,7 +1457,10 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
             if selectedWindowText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
 
             sharedState.withLock { state in
-                Self.appendText(selectedWindowText, to: &state.completedText)
+                let transcript = QwenTranscriptionText.parse(
+                    selectedWindowText, forcedLanguage: params.config.language, expectsHeader: true
+                ).text
+                QwenTranscriptionText.appendText(transcript, to: &state.completedText)
                 state.confirmedTokenIds = []
                 state.provisionalTokenIds = []
                 state.provisionalFirstSeen = []
@@ -1690,9 +1549,9 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                     state.provisionalAgreementCounts = []
                 }
                 if let tokenizer = model.tokenizer, !state.confirmedTokenIds.isEmpty {
-                    state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
+                    state.confirmedText = QwenTranscriptionText.parse(tokenizer.decode(tokens: state.confirmedTokenIds), forcedLanguage: config.language, expectsHeader: true).text
                 }
-                return Self.concatText(state.completedText, state.confirmedText)
+                return QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
             }
 
             return StopSnapshot(
@@ -1730,7 +1589,10 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 if windowText.isEmpty { continue }
 
                 shared.withLock { state in
-                    Self.appendText(windowText, to: &state.completedText)
+                    let transcript = QwenTranscriptionText.parse(
+                        windowText, forcedLanguage: config.language, expectsHeader: true
+                    ).text
+                    QwenTranscriptionText.appendText(transcript, to: &state.completedText)
                     state.confirmedTokenIds = []
                     state.provisionalTokenIds = []
                     state.provisionalFirstSeen = []
@@ -1765,8 +1627,8 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 state.provisionalTokenIds = []
                 state.provisionalFirstSeen = []
                 state.provisionalAgreementCounts = []
-                state.confirmedText = tokenizer.decode(tokens: tokenIds)
-                return Self.concatText(state.completedText, state.confirmedText)
+                state.confirmedText = QwenTranscriptionText.parse(tokenizer.decode(tokens: tokenIds), forcedLanguage: config.language, expectsHeader: true).text
+                return QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
             }
 
             let totalAudioSeconds = Double(snapshot.totalSamples) / 16000.0
@@ -1787,9 +1649,9 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                     state.provisionalAgreementCounts = []
                 }
                 if let tokenizer = model.tokenizer, !state.confirmedTokenIds.isEmpty {
-                    state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
+                    state.confirmedText = QwenTranscriptionText.parse(tokenizer.decode(tokens: state.confirmedTokenIds), forcedLanguage: config.language, expectsHeader: true).text
                 }
-                return Self.concatText(state.completedText, state.confirmedText)
+                return QwenTranscriptionText.concatText(state.completedText, state.confirmedText)
             }
         }
 
