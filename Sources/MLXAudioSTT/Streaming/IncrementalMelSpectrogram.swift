@@ -52,12 +52,13 @@ public class IncrementalMelSpectrogram {
         self.nMels = nMels
         self.overlapSize = nFft - hopLength
 
-        self.window = hanningWindow(size: nFft)
+        self.window = hanningWindow(size: nFft, periodic: true)
         self.filters = melFilters(
             sampleRate: sampleRate,
             nFft: nFft,
             nMels: nMels,
-            norm: "slaney"
+            norm: "slaney",
+            melScale: .slaney
         )
     }
 
@@ -98,13 +99,12 @@ public class IncrementalMelSpectrogram {
             signal = overlapBuffer + samples
         }
 
-        // Calculate how many complete frames we can compute
-        let numFrames = max(0, (signal.count - nFft) / hopLength + 1)
-        guard numFrames > 0 else {
-            // Not enough samples yet - save everything as overlap
+        // Wait for a complete frame before dividing: Swift truncates negative quotients toward zero.
+        guard signal.count >= nFft else {
             overlapBuffer = signal
             return nil
         }
+        let numFrames = (signal.count - nFft) / hopLength + 1
 
         // Save leftover samples for next chunk
         let consumedSamples = (numFrames - 1) * hopLength + nFft
