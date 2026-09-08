@@ -471,6 +471,15 @@ public class Qwen3ASRAudioEncoder: Module {
         _ inputFeatures: MLXArray,
         featureAttentionMask: MLXArray? = nil
     ) -> MLXArray {
+        callAsFunction(inputFeatures, featureAttentionMask: featureAttentionMask, checkpoint: { _ in })
+    }
+
+    public func callAsFunction(
+        _ inputFeatures: MLXArray,
+        featureAttentionMask: MLXArray? = nil,
+        checkpoint: (String) throws -> Void
+    ) rethrows -> MLXArray {
+        try checkpoint("encoder_begin")
         // inputFeatures shape: [batch, n_mels, n_frames]
         let batchSize = inputFeatures.dim(0)
         let nFrames = inputFeatures.dim(2)
@@ -541,6 +550,7 @@ public class Qwen3ASRAudioEncoder: Module {
         var chunkIdx = 0
 
         for batchStart in stride(from: 0, to: paddedChunks.count, by: convBatchSize) {
+            try checkpoint("conv_batch_begin")
             let batchEnd = min(batchStart + convBatchSize, paddedChunks.count)
             let batchSlice = Array(paddedChunks[batchStart..<batchEnd])
             let batchLen = batchSlice.count
@@ -562,7 +572,9 @@ public class Qwen3ASRAudioEncoder: Module {
             let posEmb = positionalEmbedding(x.dim(1))
             x = x + posEmb.expandedDimensions(axis: 0)
 
+            try checkpoint("conv_eval_begin")
             eval(x) 
+            try checkpoint("conv_eval_end")
 
             // Extract valid-length hidden states
             for i in 0..<batchLen {
@@ -609,6 +621,7 @@ public class Qwen3ASRAudioEncoder: Module {
 
         for (_, group) in windowsByLen {
             for bStart in stride(from: 0, to: group.count, by: encoderBatchSize) {
+                try checkpoint("transformer_batch_begin")
                 let bEnd = min(bStart + encoderBatchSize, group.count)
                 let batchItems = Array(group[bStart..<bEnd])
 
@@ -617,7 +630,9 @@ public class Qwen3ASRAudioEncoder: Module {
                 for layer in layers {
                     batch = layer(batch, mask: nil)
                 }
+                try checkpoint("transformer_eval_begin")
                 eval(batch)
+                try checkpoint("transformer_eval_end")
 
                 for (j, item) in batchItems.enumerated() {
                     processedWindows.append((index: item.index, data: batch[j]))
@@ -969,7 +984,15 @@ public class Qwen3ASRModel: Module {
         _ inputFeatures: MLXArray,
         featureAttentionMask: MLXArray? = nil
     ) -> MLXArray {
-        return audioTower(inputFeatures, featureAttentionMask: featureAttentionMask)
+        getAudioFeatures(inputFeatures, featureAttentionMask: featureAttentionMask, checkpoint: { _ in })
+    }
+
+    public func getAudioFeatures(
+        _ inputFeatures: MLXArray,
+        featureAttentionMask: MLXArray? = nil,
+        checkpoint: (String) throws -> Void
+    ) rethrows -> MLXArray {
+        return try audioTower(inputFeatures, featureAttentionMask: featureAttentionMask, checkpoint: checkpoint)
     }
 
     // MARK: - Forward Pass
@@ -981,6 +1004,20 @@ public class Qwen3ASRModel: Module {
         featureAttentionMask: MLXArray? = nil,
         cache: [KVCache]? = nil
     ) -> MLXArray {
+        callAsFunction(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
+            inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
+            cache: cache, checkpoint: { _ in })
+    }
+
+    public func callAsFunction(
+        inputIds: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
+        inputFeatures: MLXArray? = nil,
+        featureAttentionMask: MLXArray? = nil,
+        cache: [KVCache]? = nil,
+        checkpoint: (String) throws -> Void
+    ) rethrows -> MLXArray {
+        try checkpoint("model_call_begin")
         var inputsEmbeds: MLXArray
         if let embeddings = inputEmbeddings {
             inputsEmbeds = embeddings
@@ -991,8 +1028,9 @@ public class Qwen3ASRModel: Module {
         // Encode and merge audio features on first pass
         if let features = inputFeatures,
            cache == nil || cache?.first == nil || (cache?.first as? KVCacheSimple)?.offset == 0 {
-            let audioFeatures = getAudioFeatures(features, featureAttentionMask: featureAttentionMask)
+            let audioFeatures = try getAudioFeatures(features, featureAttentionMask: featureAttentionMask, checkpoint: checkpoint)
                 .asType(inputsEmbeds.dtype)
+            try checkpoint("encoder_return")
 
             inputsEmbeds = mergeAudioFeatures(
                 inputsEmbeds: inputsEmbeds,
@@ -1001,6 +1039,7 @@ public class Qwen3ASRModel: Module {
             )
         }
 
+        try checkpoint("text_model_begin")
         let hiddenStates = model(inputsEmbeds: inputsEmbeds, cache: cache)
 
         if let lmHead = lmHead {
