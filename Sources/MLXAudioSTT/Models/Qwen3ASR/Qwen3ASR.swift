@@ -1036,6 +1036,46 @@ public class Qwen3ASRModel: Module {
         cache: [KVCache]? = nil,
         checkpoint: (String) throws -> Void
     ) rethrows -> MLXArray {
+        try forwardLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
+            inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
+            cache: cache, lastRowOnly: false, checkpoint: checkpoint)
+    }
+
+    /// Next-token logits [batch, 1, vocabulary]; complete hidden states and KV updates retained.
+    public func nextTokenLogits(
+        inputIds: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
+        inputFeatures: MLXArray? = nil,
+        featureAttentionMask: MLXArray? = nil,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        nextTokenLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
+            inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
+            cache: cache, checkpoint: { _ in })
+    }
+
+    public func nextTokenLogits(
+        inputIds: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
+        inputFeatures: MLXArray? = nil,
+        featureAttentionMask: MLXArray? = nil,
+        cache: [KVCache]? = nil,
+        checkpoint: (String) throws -> Void
+    ) rethrows -> MLXArray {
+        try forwardLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
+            inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
+            cache: cache, lastRowOnly: true, checkpoint: checkpoint)
+    }
+
+    private func forwardLogits(
+        inputIds: MLXArray,
+        inputEmbeddings: MLXArray?,
+        inputFeatures: MLXArray?,
+        featureAttentionMask: MLXArray?,
+        cache: [KVCache]?,
+        lastRowOnly: Bool,
+        checkpoint: (String) throws -> Void
+    ) rethrows -> MLXArray {
         try checkpoint("model_call_begin")
         var inputsEmbeds: MLXArray
         if let embeddings = inputEmbeddings {
@@ -1061,10 +1101,18 @@ public class Qwen3ASRModel: Module {
         try checkpoint("text_model_begin")
         let hiddenStates = model(inputsEmbeds: inputsEmbeds, cache: cache)
 
-        if let lmHead = lmHead {
-            return lmHead(hiddenStates)
+        let projectionInput: MLXArray
+        if lastRowOnly {
+            let length = hiddenStates.dim(1)
+            precondition(length > 0, "next-token projection requires a nonempty sequence")
+            projectionInput = hiddenStates[0..., (length - 1)..<length, 0...]
         } else {
-            return model.embedTokens.asLinear(hiddenStates)
+            projectionInput = hiddenStates
+        }
+        if let lmHead = lmHead {
+            return lmHead(projectionInput)
+        } else {
+            return model.embedTokens.asLinear(projectionInput)
         }
     }
 
