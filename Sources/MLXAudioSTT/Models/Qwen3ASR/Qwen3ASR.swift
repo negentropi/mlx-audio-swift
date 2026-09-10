@@ -450,6 +450,9 @@ public class Qwen3ASRAudioEncoder: Module {
         self._proj2.wrappedValue = Linear(embedDim, config.outputDim)
     }
 
+    var transformerBatchReuseLookup: ((MLXArray, [Int]) -> MLXArray?)?
+    var transformerBatchReuseStore: ((MLXArray, [Int], MLXArray) -> Void)?
+
     private func createBlockAttentionMask(
         seqLen: Int, cuSeqlens: [Int], dtype: DType
     ) -> MLXArray {
@@ -627,12 +630,19 @@ public class Qwen3ASRAudioEncoder: Module {
 
                 // [batchLen, windowLen, d_model] — full self-attention within each window
                 var batch = MLX.stacked(batchItems.map { $0.data }, axis: 0)
-                for layer in layers {
-                    batch = layer(batch, mask: nil)
+                let reuseInput = batch
+                let reuseIndices = batchItems.map { $0.index }
+                if let reused = transformerBatchReuseLookup?(batch, reuseIndices) {
+                    batch = reused
+                } else {
+                    for layer in layers {
+                        batch = layer(batch, mask: nil)
+                    }
                 }
                 try checkpoint("transformer_eval_begin")
                 eval(batch)
                 try checkpoint("transformer_eval_end")
+                transformerBatchReuseStore?(reuseInput, reuseIndices, batch)
 
                 for (j, item) in batchItems.enumerated() {
                     processedWindows.append((index: item.index, data: batch[j]))
@@ -976,6 +986,15 @@ public class Qwen3ASRModel: Module {
                 bias: false
             )
         }
+    }
+
+    /// The caller owns serial model access and clears callbacks after each operation.
+    public func setTransformerBatchReuse(
+        lookup: ((MLXArray, [Int]) -> MLXArray?)?,
+        store: ((MLXArray, [Int], MLXArray) -> Void)?
+    ) {
+        audioTower.transformerBatchReuseLookup = lookup
+        audioTower.transformerBatchReuseStore = store
     }
 
     // MARK: - Audio Features
