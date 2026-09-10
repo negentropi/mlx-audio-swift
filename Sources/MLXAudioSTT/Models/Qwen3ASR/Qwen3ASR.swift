@@ -1076,6 +1076,27 @@ public class Qwen3ASRModel: Module {
             cache: cache, lastRows: proposedTokens + 1, checkpoint: checkpoint)
     }
 
+    /// Prepares the same audio/text input boundary used by ordinary forward calls.
+    public func prepareInputEmbeddings(inputIds: MLXArray, inputEmbeddings: MLXArray? = nil,
+        inputFeatures: MLXArray, featureAttentionMask: MLXArray? = nil,
+        checkpoint: (String) throws -> Void) rethrows -> MLXArray {
+        let text = inputEmbeddings ?? model.embedTokens(inputIds)
+        let audio = try getAudioFeatures(inputFeatures, featureAttentionMask: featureAttentionMask,
+            checkpoint: checkpoint).asType(text.dtype)
+        try checkpoint("encoder_return")
+        return mergeAudioFeatures(inputsEmbeds: text, audioFeatures: audio, inputIds: inputIds)
+    }
+
+    /// Verify a proposal after the caller has retained an unchanged causal input prefix.
+    public func verificationLogits(inputIds: MLXArray, inputEmbeddings: MLXArray,
+        cache: [KVCache], proposedTokens: Int,
+        checkpoint: (String) throws -> Void) rethrows -> MLXArray {
+        precondition((0...8).contains(proposedTokens))
+        return try forwardLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
+            inputFeatures: nil, featureAttentionMask: nil, cache: cache,
+            lastRows: proposedTokens + 1, checkpoint: checkpoint)
+    }
+
     private func forwardLogits(
         inputIds: MLXArray,
         inputEmbeddings: MLXArray?,
@@ -1086,25 +1107,15 @@ public class Qwen3ASRModel: Module {
         checkpoint: (String) throws -> Void
     ) rethrows -> MLXArray {
         try checkpoint("model_call_begin")
-        var inputsEmbeds: MLXArray
-        if let embeddings = inputEmbeddings {
-            inputsEmbeds = embeddings
-        } else {
-            inputsEmbeds = model.embedTokens(inputIds)
-        }
-
+        let inputsEmbeds: MLXArray
         // Encode and merge audio features on first pass
         if let features = inputFeatures,
            cache == nil || cache?.first == nil || (cache?.first as? KVCacheSimple)?.offset == 0 {
-            let audioFeatures = try getAudioFeatures(features, featureAttentionMask: featureAttentionMask, checkpoint: checkpoint)
-                .asType(inputsEmbeds.dtype)
-            try checkpoint("encoder_return")
-
-            inputsEmbeds = mergeAudioFeatures(
-                inputsEmbeds: inputsEmbeds,
-                audioFeatures: audioFeatures,
-                inputIds: inputIds
-            )
+            inputsEmbeds = try prepareInputEmbeddings(inputIds: inputIds,
+                inputEmbeddings: inputEmbeddings, inputFeatures: features,
+                featureAttentionMask: featureAttentionMask, checkpoint: checkpoint)
+        } else {
+            inputsEmbeds = inputEmbeddings ?? model.embedTokens(inputIds)
         }
 
         try checkpoint("text_model_begin")
