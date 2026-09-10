@@ -1038,7 +1038,7 @@ public class Qwen3ASRModel: Module {
     ) rethrows -> MLXArray {
         try forwardLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
             inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
-            cache: cache, lastRowOnly: false, checkpoint: checkpoint)
+            cache: cache, lastRows: nil, checkpoint: checkpoint)
     }
 
     /// Next-token logits [batch, 1, vocabulary]; complete hidden states and KV updates retained.
@@ -1064,7 +1064,16 @@ public class Qwen3ASRModel: Module {
     ) rethrows -> MLXArray {
         try forwardLogits(inputIds: inputIds, inputEmbeddings: inputEmbeddings,
             inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
-            cache: cache, lastRowOnly: true, checkpoint: checkpoint)
+            cache: cache, lastRows: 1, checkpoint: checkpoint)
+    }
+
+    public func verificationLogits(inputIds: MLXArray, inputFeatures: MLXArray,
+        featureAttentionMask: MLXArray, cache: [KVCache], proposedTokens: Int,
+        checkpoint: (String) throws -> Void) rethrows -> MLXArray {
+        precondition((0...8).contains(proposedTokens))
+        return try forwardLogits(inputIds: inputIds, inputEmbeddings: nil,
+            inputFeatures: inputFeatures, featureAttentionMask: featureAttentionMask,
+            cache: cache, lastRows: proposedTokens + 1, checkpoint: checkpoint)
     }
 
     private func forwardLogits(
@@ -1073,7 +1082,7 @@ public class Qwen3ASRModel: Module {
         inputFeatures: MLXArray?,
         featureAttentionMask: MLXArray?,
         cache: [KVCache]?,
-        lastRowOnly: Bool,
+        lastRows: Int?,
         checkpoint: (String) throws -> Void
     ) rethrows -> MLXArray {
         try checkpoint("model_call_begin")
@@ -1102,10 +1111,10 @@ public class Qwen3ASRModel: Module {
         let hiddenStates = model(inputsEmbeds: inputsEmbeds, cache: cache)
 
         let projectionInput: MLXArray
-        if lastRowOnly {
+        if let lastRows {
             let length = hiddenStates.dim(1)
-            precondition(length > 0, "next-token projection requires a nonempty sequence")
-            projectionInput = hiddenStates[0..., (length - 1)..<length, 0...]
+            precondition(lastRows > 0 && lastRows <= length, "invalid projection row count")
+            projectionInput = hiddenStates[0..., (length - lastRows)..<length, 0...]
         } else {
             projectionInput = hiddenStates
         }
